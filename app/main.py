@@ -9,21 +9,27 @@
 - POST /api/weights/jobs              提交旧版→新版权重计算任务
 - GET  /api/weights/jobs              任务列表
 - GET  /api/weights/jobs/{job_id}     查询并交付结果（含失效检测）
+- POST /api/qc/batches                提交站点归属质控批次
+- GET  /api/qc/batches                质控批次列表（可按版号过滤）
+- GET  /api/qc/batches/{batch_id}     查询批次逐点结论与供数资格
+- POST /api/qc/batches/{batch_id}/recalculate  基于当前地图修订重算
 """
 from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
-from . import geo
+from . import config, geo, station_qc
 from .db import Database
 from .geo import GeoValidationError
 from .jobs import COMPLETED, FAILED, PENDING, RUNNING, STALE, JobError, JobManager
+from .qc_jobs import QcManager
+from .station_qc import StationQcValidationError
 
 
 # ----------------------------------------------------------------------
@@ -51,25 +57,104 @@ class JobSubmitRequest(BaseModel):
 
 
 # ----------------------------------------------------------------------
+# 站点归属质控请求 / 响应模型
+# ----------------------------------------------------------------------
+class StationPointIn(BaseModel):
+    station_id: str = Field(..., description="批内唯一站点号")
+    lon: float = Field(..., description="WGS84 经度")
+    lat: float = Field(..., description="WGS84 纬度")
+    reported_township_id: str = Field(..., description="上报乡镇号")
+
+
+class QcBatchSubmitRequest(BaseModel):
+    map_version: str = Field(
+        ..., description="选用的已受理地图版号（计算时钉取其修订号）"
+    )
+    stations: list[StationPointIn] = Field(..., min_length=1)
+
+
+class QcSummary(BaseModel):
+    total: int
+    matched: int
+    pending_review: int
+    report_mismatch: int
+    all_matched: bool
+
+
+class QcPointOut(BaseModel):
+    station_id: str
+    lon: float
+    lat: float
+    reported_township_id: str
+    status: str = Field(
+        ...,
+        description="matched=唯一面内部；boundary/hole/no_coverage/multi_hit 均为待核",
+    )
+    matched_township_id: Optional[str] = None
+    covering_township_ids: list[str] = []
+    containing_township_ids: list[str] = []
+    reported_match: Optional[bool] = None
+    reasons: list[str] = []
+
+
+class QcBatchOut(BaseModel):
+    batch_id: str
+    map_version: str
+    pinned_revision: int
+    current_revision: Optional[int] = None
+    status: str
+    source_batch_id: Optional[str] = None
+    superseded_by: Optional[str] = None
+    created_at: str
+    updated_at: str
+    summary: QcSummary
+    eligible_for_ingestion: bool = Field(
+        ..., description="整批是否可供数：ready 且地图未更正且全部匹配且上报一致"
+    )
+    ineligible_reasons: list[str] = []
+    evaluated_at: str
+    error: Optional[str] = None
+    points: list[QcPointOut] = []
+
+
+class QcBatchSummaryOut(BaseModel):
+    batch_id: str
+    map_version: str
+    pinned_revision: int
+    current_revision: Optional[int] = None
+    status: str
+    source_batch_id: Optional[str] = None
+    superseded_by: Optional[str] = None
+    summary: QcSummary
+    created_at: str
+
+
+# ----------------------------------------------------------------------
 # 生命周期
 # ----------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.db = Database()
     app.state.jobs = JobManager(app.state.db)
+    app.state.qc = QcManager(app.state.db)
+    # 重启恢复：上次进程遗留的 recalculating 批次落 failed，
+    # 其源批次保持 superseded，旧结论不会复活
+    app.state.db.recover_interrupted_recalculations()
     yield
+    app.state.qc.shutdown()
     app.state.jobs.shutdown()
     app.state.db.close()
 
 
 app = FastAPI(
-    title="乡镇边界面积权重 API",
+    title="乡镇边界面积权重 / 站点归属质控 API",
     description=(
         "按版受理 WGS84 乡镇面 GeoJSON，计算旧版乡镇到新版乡镇的"
-        "等面积交叠权重。同版重传为整版更正；源版在计算期间变化时，"
-        "旧权重拒绝交付并提示重试。"
+        "等面积交叠权重；并提供县域站点入仓前的归属质控："
+        "仅落在单个乡镇面内部的站点判为归属，边界、洞内、无覆盖、"
+        "多重命中一律待核。同版地图更正后旧批次结论立即失去供数资格。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -80,6 +165,10 @@ def get_db(request: Request) -> Database:
 
 def get_jobs(request: Request) -> JobManager:
     return request.app.state.jobs
+
+
+def get_qc(request: Request) -> QcManager:
+    return request.app.state.qc
 
 
 async def _read_geojson_body(request: Request) -> bytes:
@@ -270,3 +359,91 @@ def get_job(job_id: str, request: Request):
     if job.state == FAILED:
         raise HTTPException(status_code=422, detail=payload)
     return payload
+
+
+# ----------------------------------------------------------------------
+# 站点归属质控
+# ----------------------------------------------------------------------
+@app.post(
+    "/api/qc/batches",
+    response_model=QcBatchOut,
+    tags=["station-qc"],
+    status_code=status.HTTP_201_CREATED,
+    summary="提交站点归属质控批次（同步出结论并留存）",
+)
+def submit_qc_batch(
+    body: QcBatchSubmitRequest, request: Request
+) -> QcBatchOut:
+    db = get_db(request)
+    qc = get_qc(request)
+
+    revision = db.get_revision(body.map_version)
+    if revision is None:
+        raise HTTPException(
+            status_code=404, detail=f"地图版号不存在：{body.map_version}"
+        )
+
+    # 显式再校验一次：Pydantic 已保证结构/类型，这里覆盖批内唯一性、
+    # WGS84 范围、批大小等业务约束并给出中文错误
+    raw_stations = [s.model_dump() for s in body.stations]
+    try:
+        stations = station_qc.validate_station_points(
+            raw_stations, config.MAX_QC_POINTS
+        )
+    except StationQcValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # manager 在 DB 锁内快照修订号 + 几何，与同版更正互斥
+    batch_id = qc.submit_initial(body.map_version, stations)
+    payload = qc.build_batch_payload(batch_id)
+    return QcBatchOut(**payload)
+
+
+@app.get(
+    "/api/qc/batches",
+    response_model=list[QcBatchSummaryOut],
+    tags=["station-qc"],
+    summary="列出质控批次（可按 map_version 过滤，其他版本照常查询）",
+)
+def list_qc_batches(
+    request: Request, map_version: Optional[str] = None
+) -> list[QcBatchSummaryOut]:
+    return [
+        QcBatchSummaryOut(**row)
+        for row in get_qc(request).list_batch_summaries(map_version)
+    ]
+
+
+@app.get(
+    "/api/qc/batches/{batch_id}",
+    response_model=QcBatchOut,
+    tags=["station-qc"],
+    summary="查询批次：逐点归属、问题原因与整批供数资格",
+)
+def get_qc_batch(batch_id: str, request: Request) -> QcBatchOut:
+    payload = get_qc(request).build_batch_payload(batch_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"质控批次不存在：{batch_id}")
+    return QcBatchOut(**payload)
+
+
+@app.post(
+    "/api/qc/batches/{batch_id}/recalculate",
+    response_model=QcBatchOut,
+    tags=["station-qc"],
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="基于当前地图修订重算（旧批次同事务被取代，立即失去供数资格）",
+)
+def recalculate_qc_batch(batch_id: str, request: Request) -> QcBatchOut:
+    qc = get_qc(request)
+    try:
+        new_batch_id = qc.start_recalculation(batch_id)
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"质控批次不存在：{exc}"
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    payload = qc.build_batch_payload(new_batch_id)
+    return QcBatchOut(**payload)

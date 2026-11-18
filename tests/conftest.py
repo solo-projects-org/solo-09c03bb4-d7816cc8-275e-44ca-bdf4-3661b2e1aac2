@@ -26,6 +26,9 @@ def client():
     with TestClient(app) as c:
         # 每个测试开始前清空共享库，保证版号修订号从 1 开始、用例互不污染
         with app.state.db._lock:
+            app.state.db._conn.execute("DELETE FROM qc_points")
+            app.state.db._conn.execute("DELETE FROM qc_batches")
+            app.state.db._conn.execute("DELETE FROM map_features")
             app.state.db._conn.execute("DELETE FROM maps")
         yield c
 
